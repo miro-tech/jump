@@ -1,0 +1,208 @@
+name: Update KeyHop configs
+
+on:
+  workflow_dispatch:
+
+  schedule:
+    # GitHub Actions использует UTC.
+    # 00:00, 04:00, 08:00, 12:00, 16:00, 20:00 UTC
+    - cron: "0 0 1 * *"
+
+permissions:
+  contents: read
+
+jobs:
+  update:
+    name: Fetch KeyHop and update Gist
+    runs-on: ubuntu-latest
+
+    steps:
+      # ============================================================
+      # CHECKOUT
+      # ============================================================
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ============================================================
+      # PYTHON
+      # ============================================================
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      # ============================================================
+      # DEPENDENCIES
+      # ============================================================
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # ============================================================
+      # RUN KEYHOP PARSER
+      # ============================================================
+      - name: Fetch KeyHop configs
+        run: |
+          mkdir -p output
+
+          python keyhop_fetch.py
+
+          echo
+          echo "=============================="
+          echo "Generated files:"
+          echo "=============================="
+
+          ls -lah output
+
+          echo
+          echo "READY count:"
+          if [ -f output/keyhop_uris_ready.txt ]; then
+            grep -c '^' output/keyhop_uris_ready.txt || true
+          else
+            echo "0"
+          fi
+
+      # ============================================================
+      # VALIDATE RESULT
+      # ============================================================
+      - name: Validate generated configs
+        run: |
+          test -s output/keyhop_uris_ready.txt
+
+          COUNT=$(grep -Ec '^(hysteria2|hy2|trojan|vless|mieru|tuic|ss|ssr|vmess)://' \
+            output/keyhop_uris_ready.txt || true)
+
+          echo "Valid READY URIs: $COUNT"
+
+          if [ "$COUNT" -eq 0 ]; then
+            echo "ERROR: no valid READY URIs"
+            exit 1
+          fi
+
+      # ============================================================
+      # UPDATE GIST
+      # ============================================================
+      - name: Update Gist
+        env:
+          GH_TOKEN: ${{ secrets.GIST_TOKEN }}
+          GIST_ID: ${{ secrets.GIST_ID }}
+        run: |
+          set -e
+
+          if [ -z "$GH_TOKEN" ]; then
+            echo "ERROR: GIST_TOKEN secret is missing"
+            exit 1
+          fi
+
+          if [ -z "$GIST_ID" ]; then
+            echo "ERROR: GIST_ID secret is missing"
+            exit 1
+          fi
+
+          python - <<'PY'
+          import json
+          import os
+          import urllib.request
+
+          token = os.environ["GH_TOKEN"]
+          gist_id = os.environ["GIST_ID"]
+
+          output_dir = "output"
+
+          files = [
+              "keyhop_uris_ready.txt",
+              "keyhop_uris_all.txt",
+              "keyhop_uris_unique.txt",
+              "keyhop_uris_clean.txt",
+              "keyhop_servers.json",
+          ]
+
+          data = {}
+
+          for name in files:
+              path = os.path.join(output_dir, name)
+
+              if not os.path.isfile(path):
+                  print(f"[SKIP] {name}: file not found")
+                  continue
+
+              with open(path, "r", encoding="utf-8") as f:
+                  content = f.read()
+
+              if not content.strip():
+                  print(f"[SKIP] {name}: empty")
+                  continue
+
+              data[name] = {
+                  "content": content
+              }
+
+              print(f"[ADD] {name}: {len(content)} bytes")
+
+          if "keyhop_uris_ready.txt" not in data:
+              raise SystemExit(
+                  "ERROR: keyhop_uris_ready.txt is missing or empty"
+              )
+
+          payload = json.dumps({
+              "description": "KeyHop / Jump VPN — automatically updated configs",
+              "public": True,
+              "files": data,
+          }).encode("utf-8")
+
+          req = urllib.request.Request(
+              f"https://api.github.com/gists/{gist_id}",
+              data=payload,
+              method="PATCH",
+              headers={
+                  "Authorization": f"Bearer {token}",
+                  "Accept": "application/vnd.github+json",
+                  "X-GitHub-Api-Version": "2022-11-28",
+                  "Content-Type": "application/json",
+                  "User-Agent": "keyhop-github-action",
+              },
+          )
+
+          try:
+              with urllib.request.urlopen(req, timeout=30) as resp:
+                  body = resp.read().decode("utf-8", errors="replace")
+                  print(f"Gist updated: HTTP {resp.status}")
+
+                  result = json.loads(body)
+
+                  html_url = result.get("html_url")
+                  if html_url:
+                      print(f"Gist: {html_url}")
+
+          except Exception as e:
+              print(f"ERROR updating Gist: {e}")
+              raise
+          PY
+
+      # ============================================================
+      # SUMMARY
+      # ============================================================
+      - name: Summary
+        run: |
+          echo "## KeyHop update" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+
+          echo "| File | Size |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---:|" >> "$GITHUB_STEP_SUMMARY"
+
+          for f in output/*; do
+            if [ -f "$f" ]; then
+              SIZE=$(wc -c < "$f")
+              NAME=$(basename "$f")
+              echo "| $NAME | $SIZE bytes |" >> "$GITHUB_STEP_SUMMARY"
+            fi
+          done
+
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+
+          COUNT=$(grep -Ec '^(hysteria2|hy2|trojan|vless|mieru|tuic|ss|ssr|vmess)://' \
+            output/keyhop_uris_ready.txt || true)
+
+          echo "**READY URIs:** $COUNT" >> "$GITHUB_STEP_SUMMARY"
